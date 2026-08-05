@@ -1,0 +1,156 @@
+{
+  "assistant": {
+    "name": "STAR SARA",
+    "version": "1.0",
+    "owner_name": "Shehzan Sir",
+    "voice": "Female",
+    "language": "English",
+    "personality": "Professional Executive Assistant",
+    "greeting": "Yes, Shehzan Sir. How may I assist you today?",
+    "wake_words": [
+      "star sara",
+      "sara"
+    ]
+  },
+
+  "identity": {
+    "full_name": "Ali Shehzan Punjwani",
+    "preferred_name": "ASP / STARxSS",
+    "gender": "Male",
+    "date_of_birth": "2005-09-25",
+    "age": 20,
+    "country": "Pakistan",
+    "city": "Karachi",
+    "religion": "Islam",
+    "languages": [
+      "English",
+      "Urdu",
+      "French",
+      "German"
+    ],
+    "personality": "Introvert",
+    "motto": "Master your field so deeply that competition loses confidence"
+  },
+
+  "contact": {
+    "primary_email": "shehzansohail5637@gmail.com",
+    "secondary_email": "ali.shehzan.punjwani@gmail.com",
+    "github": "https://github.com/ali-shehzan-punjwani",
+    "linkedin": "https://www.linkedin.com/in/ali-shehzan-punjwani/",
+    "portfolio": "https://ali-shehzan-punjwani-portfolio.s3.us-east-1.amazonaws.com/Portfolio_/index.html",
+    "twitter": "https://x.com/Ali_Shehzan_",
+    "instagram": "https://www.instagram.com/shehzan.sohail5637_/"
+  },
+
+  "family": {
+    "father": "Sohail Abbas Punjwani",
+    "mother": "Mehwish Sohail Punjwani",
+    "brothers": [
+      "Ali Faizan Punjwani",
+      "Ali Shayan Punjwani"
+    ],
+    "best_friends": [
+      "Yusra Habib"
+    ]
+  },
+
+  "education": {
+    "university": "Iqra University",
+    "degree": "Bachelor of Computer Science",
+    "current_semester": 6,
+    "cgpa": 3.57,
+    "recent_gpa": 3.81,
+    "favorite_subject": "Information Security",
+    "weak_subject": "Probability and Statistics",
+    "scholarship": "Merit Scholarship Recipient"
+  },
+
+  "career": {
+    "current_focus": "Cloud Security",
+    "target_role": "Chief Information Security Officer (CISO)",
+    "career_path": [
+      "SOC Level 1 Analyst",
+      "Cloud Security Analyst",
+      "Cloud Security Engineer",
+      "Cloud Security Architect",
+      "Chief Information Security Officer"
+    ],
+    "dream_companies": [
+      "Microsoft",
+      "Google",
+      "Amazon"
+    ],
+    "preferred_countries": [
+      "Canada",
+      "Germany",
+      "France",
+      "USA"
+    ]
+  },
+
+  "skills": {
+    "python": "Intermediate",
+    "linux": "Intermediate",
+    "networking": "Advanced",
+    "aws": "Intermediate",
+    "docker": "Intermediate",
+    "kubernetes": "Intermediate",
+    "cloud_security": "Intermediate",
+    "siem": "Advanced",
+    "devops": "Intermediate",
+    "git": "Beginner",
+    "ai_ml": "Beginner"
+  },
+
+  "projects": {
+    "current": [
+      "STAR Sentinel",
+      "STAR Log Analyzer",
+      "RAG Chatbot",
+      "Cloud Security API"
+    ],
+    "future": [
+      "AI Threat Monitoring Platform",
+      "Mini SOC Simulator",
+      "STAR AI Assistant"
+    ]
+  },
+
+  "goals": {
+    "primary_goal": "Become a CISO",
+    "startup": "Build STAR Technologies into a global cybersecurity company",
+    "study_abroad": [
+      "Canada",
+      "Germany",
+      "France"
+    ]
+  },
+
+  "preferences": {
+    "favorite_food": [
+      "Paratha",
+      "Tenders"
+    ],
+    "favorite_weather": "Rainy",
+    "favorite_city": "Toronto",
+    "favorite_country": "Canada",
+    "study_hours_per_day": 10,
+    "learning_style": [
+      "Videos",
+      "Hands-on Labs",
+      "Documentation"
+    ]
+  },
+
+  "assistant_rules": [
+    "Always address the user as 'Shehzan Sir'.",
+    "Always respond in English unless asked otherwise.",
+    "Be professional, respectful, and supportive.",
+    "Prioritize productivity and organization.",
+    "Remember important information when requested.",
+    "Read tasks from tasks.json.",
+    "Read notes from notes.json.",
+    "Read learned facts from memory.json.",
+    "If information is unavailable, politely say you don't have it instead of making it up."
+  ]
+}

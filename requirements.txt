@@ -1,0 +1,14 @@
+PySide6>=6.6.0
+groq>=0.9.0
+python-dotenv>=1.0.0
+openai-whisper>=20231117
+torch>=2.1.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+edge-tts>=6.1.9
+pygame>=2.5.2
+numpy>=1.24.0
+rapidfuzz>=3.6.0      # fuzzy wake-word matching + memory dedupe + intent scoring
+webrtcvad>=2.0.10     # Voice Activity Detection (end-of-speech detection)
+numpy>=1.26.0         # audio array processing (you likely already have this via whisper)
+noisereduce>=3.0.0  
