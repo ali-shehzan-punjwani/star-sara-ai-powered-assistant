@@ -49,14 +49,21 @@ import soundfile as sf
 import edge_tts
 import pygame
 
-# ---- optional / graceful-degradation dependencies ----
+from star_sara_utils import (
+    RAPIDFUZZ_AVAILABLE,
+    format_numbered_list,
+    load_json,
+    load_json_collection,
+    log_error,
+    log_warning,
+    now_iso,
+    polar_point,
+    save_json,
+    strip_phrases,
+    text_similarity,
+)
 
-try:
-    from rapidfuzz import fuzz as _fuzz
-    RAPIDFUZZ_AVAILABLE = Truea
-except Exception:
-    import difflib
-    RAPIDFUZZ_AVAILABLE = False
+# ---- optional / graceful-degradation dependencies ----
 
 try:
     import webrtcvad
@@ -99,7 +106,7 @@ if GROQ_API_KEY:
         GROQ_CLIENT = Groq(api_key=GROQ_API_KEY)
         GROQ_AVAILABLE = True
     except Exception as error:
-        print(f"[ERROR] Could not initialize Groq client: {error}")
+        log_error("Could not initialize Groq client", error)
 else:
     print("[WARNING] GROQ_API_KEY missing in .env — AI brain will run in offline mode.")
 
@@ -171,43 +178,14 @@ NOTES_FILE = os.path.join(BASE_DIR, "notes.json")
 
 
 # ==============================================================================
-# JSON HELPERS
+# OWNER-FACING PHRASES
 # ==============================================================================
 
-def save_json(file_path: str, data: dict) -> None:
-    try:
-        with open(file_path, "w", encoding="utf-8") as file:
-            json.dump(data, file, indent=4, ensure_ascii=False)
-    except Exception as error:
-        print(f"[ERROR] Saving JSON ({file_path}): {error}")
+def _apology(detail: str) -> str:
+    return f"Sorry {OWNER_ADDRESS}, {detail}"
 
 
-def load_json(file_path: str, default: dict) -> dict:
-    try:
-        if os.path.exists(file_path):
-            with open(file_path, "r", encoding="utf-8") as file:
-                return json.load(file)
-        else:
-            save_json(file_path, default)
-            return default
-    except Exception as error:
-        print(f"[ERROR] Loading JSON ({file_path}): {error}")
-        return default
-
-
-def _text_similarity(a: str, b: str) -> float:
-    """
-    Unified fuzzy-similarity helper (0-100) that uses rapidfuzz when available
-    and falls back to stdlib difflib otherwise, so every fuzzy-matching
-    feature below (wake word, memory dedupe) keeps working with zero
-    extra installs, just less accurately.
-    """
-    a, b = a.lower().strip(), b.lower().strip()
-    if not a or not b:
-        return 0.0
-    if RAPIDFUZZ_AVAILABLE:
-        return _fuzz.partial_ratio(a, b)
-    return difflib.SequenceMatcher(None, a, b).ratio() * 100.0
+NO_NOTES_RESPONSE = f"You do not have any saved notes, {OWNER_ADDRESS}."
 
 
 # ==============================================================================
@@ -259,7 +237,7 @@ class AudioProcessor:
             noise_clip = flat[: int(sample_rate * 0.3)]
             return nr.reduce_noise(y=flat, sr=sample_rate, y_noise=noise_clip, stationary=True)
         except Exception as error:
-            print(f"[WARN] noisereduce failed, using raw audio: {error}")
+            log_warning("noisereduce failed, using raw audio", error)
             return audio
 
     @classmethod
@@ -323,22 +301,12 @@ class AIEngine:
         self._migrate_memory_schema()
         self._decay_memory()
 
-        self.tasks = load_json(TASKS_FILE, {"tasks": []})
-        self.notes = load_json(NOTES_FILE, {"notes": []})
-
-        # WHY this guard: load_json returns whatever is actually on disk, not
-        # the default schema — if tasks.json/notes.json exist from an earlier
-        # version of STAR SARA (or got hand-edited, or are empty {}), they may
-        # be missing the "tasks"/"notes" key entirely, and every direct
-        # self.tasks["tasks"] / self.notes["notes"] access below would raise
-        # KeyError the first time something tried to write to it.
-        if not isinstance(self.tasks, dict):
-            self.tasks = {"tasks": []}
-        self.tasks.setdefault("tasks", [])
-
-        if not isinstance(self.notes, dict):
-            self.notes = {"notes": []}
-        self.notes.setdefault("notes", [])
+        # load_json_collection returns whatever is actually on disk while
+        # guaranteeing the collection key exists — tasks.json/notes.json
+        # written by an earlier version (or hand-edited, or emptied to {})
+        # would otherwise raise KeyError on the first write.
+        self.tasks = load_json_collection(TASKS_FILE, "tasks")
+        self.notes = load_json_collection(NOTES_FILE, "notes")
 
         # short-term multi-turn context (not persisted — resets per session,
         # anything worth keeping long-term should go through `remember()`)
@@ -376,7 +344,7 @@ class AIEngine:
                 fact["importance"] = 3  # 1 (trivial) .. 5 (critical), default mid
                 changed = True
             if "created_at" not in fact:
-                fact["created_at"] = datetime.now().isoformat()
+                fact["created_at"] = now_iso()
                 changed = True
             if "last_accessed" not in fact:
                 fact["last_accessed"] = fact["created_at"]
@@ -386,6 +354,12 @@ class AIEngine:
                 changed = True
         if changed:
             save_json(MEMORY_FILE, self.memory)
+
+    @staticmethod
+    def _touch_fact(fact: Dict) -> None:
+        """Records an access on a fact — feeds ranking and decay."""
+        fact["access_count"] = fact.get("access_count", 0) + 1
+        fact["last_accessed"] = now_iso()
 
     # ---------------- memory: write ----------------
 
@@ -399,19 +373,20 @@ class AIEngine:
         facts = self.memory.setdefault("facts", [])
 
         for fact in facts:
-            if _text_similarity(fact.get("value", ""), value) >= MEMORY_DEDUPE_FUZZY_THRESHOLD:
+            if text_similarity(fact.get("value", ""), value) >= MEMORY_DEDUPE_FUZZY_THRESHOLD:
                 fact["value"] = value
                 fact["importance"] = max(fact.get("importance", 3), importance)
-                fact["last_accessed"] = datetime.now().isoformat()
+                fact["last_accessed"] = now_iso()
                 save_json(MEMORY_FILE, self.memory)
                 return f"I updated what I remembered, {OWNER_ADDRESS}."
 
+        created_at = now_iso()
         facts.append({
             "key": key,
             "value": value,
             "importance": importance,
-            "created_at": datetime.now().isoformat(),
-            "last_accessed": datetime.now().isoformat(),
+            "created_at": created_at,
+            "last_accessed": created_at,
             "access_count": 0,
         })
 
@@ -429,8 +404,7 @@ class AIEngine:
     def recall(self, key: str) -> Optional[str]:
         for item in self.memory.get("facts", []):
             if item.get("key") == key:
-                item["access_count"] = item.get("access_count", 0) + 1
-                item["last_accessed"] = datetime.now().isoformat()
+                self._touch_fact(item)
                 return item.get("value")
         return None
 
@@ -448,8 +422,8 @@ class AIEngine:
 
         scored: List[Tuple[float, Dict]] = []
         for fact in facts:
-            relevance = _text_similarity(query, fact.get("value", ""))
-            key_relevance = _text_similarity(query, fact.get("key", ""))
+            relevance = text_similarity(query, fact.get("value", ""))
+            key_relevance = text_similarity(query, fact.get("key", ""))
             score = max(relevance, key_relevance) + fact.get("importance", 3) * 4
             scored.append((score, fact))
 
@@ -457,8 +431,7 @@ class AIEngine:
         top = [fact for score, fact in scored[:top_k] if score > 20]
 
         for fact in top:
-            fact["access_count"] = fact.get("access_count", 0) + 1
-            fact["last_accessed"] = datetime.now().isoformat()
+            self._touch_fact(fact)
 
         if top:
             save_json(MEMORY_FILE, self.memory)
@@ -513,7 +486,7 @@ class AIEngine:
             "priority": priority,
             "status": "pending",
             "due": due,  # ISO date string or None — powers "calendar awareness" below
-            "created_at": datetime.now().isoformat(),
+            "created_at": now_iso(),
         })
         save_json(TASKS_FILE, self.tasks)
 
@@ -537,20 +510,28 @@ class AIEngine:
         if not pending:
             return f"You have no pending tasks, {OWNER_ADDRESS}."
 
-        response = f"You have {len(pending)} pending tasks. "
-        for number, task in enumerate(pending, start=1):
+        def render(task: Dict) -> str:
             due_note = f", due {task['due']}" if task.get("due") else ""
-            response += f"Task {number}: {task['task']}{due_note}. "
-        return response
+            return f"{task['task']}{due_note}"
+
+        return format_numbered_list(
+            pending,
+            header=f"You have {len(pending)} pending tasks. ",
+            label="Task",
+            render=render,
+        )
 
     def format_due_today(self) -> str:
         due = self.get_tasks_due_today()
         if not due:
             return f"Nothing is due today, {OWNER_ADDRESS}."
-        response = f"You have {len(due)} task(s) due today. "
-        for number, task in enumerate(due, start=1):
-            response += f"Task {number}: {task['task']}. "
-        return response
+
+        return format_numbered_list(
+            due,
+            header=f"You have {len(due)} task(s) due today. ",
+            label="Task",
+            render=lambda task: task["task"],
+        )
 
     # ---------------- notes ----------------
 
@@ -558,33 +539,33 @@ class AIEngine:
         self.notes["notes"].append({
             "title": title,
             "content": content,
-            "created_at": datetime.now().isoformat(),
+            "created_at": now_iso(),
         })
         save_json(NOTES_FILE, self.notes)
 
     def format_notes(self) -> str:
         notes = self.notes.get("notes", [])
         if not notes:
-            return f"You do not have any saved notes, {OWNER_ADDRESS}."
+            return NO_NOTES_RESPONSE
 
-        response = f"You have {len(notes)} saved notes. "
-        for number, note in enumerate(notes, start=1):
-            response += f"Note {number}: {note['title']}. {note['content']}. "
-        return response
+        return format_numbered_list(
+            notes,
+            header=f"You have {len(notes)} saved notes. ",
+            label="Note",
+            render=lambda note: f"{note['title']}. {note['content']}",
+        )
 
     def search_notes(self, query: str) -> str:
         """Keyword/fuzzy search over saved notes — 'find my note about X'."""
         notes = self.notes.get("notes", [])
         if not notes:
-            return f"You do not have any saved notes, {OWNER_ADDRESS}."
+            return NO_NOTES_RESPONSE
 
-        scored = sorted(
-            notes,
-            key=lambda n: _text_similarity(query, f"{n['title']} {n['content']}"),
-            reverse=True,
-        )
-        best = scored[0]
-        if _text_similarity(query, f"{best['title']} {best['content']}") < 40:
+        def score(note: Dict) -> float:
+            return text_similarity(query, f"{note['title']} {note['content']}")
+
+        best = max(notes, key=score)
+        if score(best) < 40:
             return f"I couldn't find a note matching that, {OWNER_ADDRESS}."
         return f"Closest match — {best['title']}: {best['content']}"
 
@@ -625,8 +606,8 @@ PERSONALITY & REASONING RULES:
 
     def ask(self, message: str) -> str:
         if not GROQ_AVAILABLE or GROQ_CLIENT is None:
-            return (
-                f"Sorry {OWNER_ADDRESS}, my AI brain is offline right now. "
+            return _apology(
+                "my AI brain is offline right now. "
                 "Please check the GROQ_API_KEY in the .env file."
             )
 
@@ -649,8 +630,8 @@ PERSONALITY & REASONING RULES:
             return reply
 
         except Exception as error:
-            print(f"[ERROR] Groq error: {error}")
-            return f"Sorry {OWNER_ADDRESS}, I am having trouble right now."
+            log_error("Groq error", error)
+            return _apology("I am having trouble right now.")
 
 
 # ==============================================================================
@@ -683,6 +664,15 @@ class IntentClassifier:
     FUZZY_MAX_LENGTH_RATIO = 1.6   # command can be at most this many times longer than the phrase
 
     @classmethod
+    def trigger_phrases(cls, intent: str) -> List[str]:
+        """
+        The phrases that route to an intent — also what handlers strip out of
+        the command to get the payload ("add task call the bank" -> "call the
+        bank"), so the keyword lists live in exactly one place.
+        """
+        return cls.INTENT_KEYWORDS.get(intent, [])
+
+    @classmethod
     def classify(cls, command: str) -> str:
         command = command.lower().strip()
         command_words = command.split()
@@ -705,7 +695,7 @@ class IntentClassifier:
                 if len(command_words) > len(phrase_words) * cls.FUZZY_MAX_LENGTH_RATIO:
                     continue
 
-                score = _text_similarity(phrase, command)
+                score = text_similarity(phrase, command)
                 if score > best_score:
                     best_intent, best_score = intent, score
 
@@ -918,7 +908,7 @@ class VoiceEngine:
                 return True
 
         if RAPIDFUZZ_AVAILABLE and word_count <= WAKE_WORD_MAX_WORDS_FOR_FUZZY:
-            if _text_similarity("star sara", lowered) >= WAKE_WORD_FUZZY_THRESHOLD:
+            if text_similarity("star sara", lowered) >= WAKE_WORD_FUZZY_THRESHOLD:
                 self._last_wake_trigger_time = now
                 return True
 
@@ -941,7 +931,7 @@ class VoiceEngine:
             await communicate.save(audio_file)
             return audio_file
         except Exception as error:
-            print(f"[ERROR] Edge-TTS error: {error}")
+            log_error("Edge-TTS error", error)
             return None
 
     def speak(self, text: str, allow_barge_in: bool = ENABLE_BARGE_IN) -> bool:
@@ -999,7 +989,7 @@ class VoiceEngine:
             return not interrupted.is_set()
 
         except Exception as error:
-            print(f"[ERROR] Voice playback failed: {error}")
+            log_error("Voice playback failed", error)
             return True
 
 
@@ -1068,18 +1058,13 @@ class AssistantWorker(QThread):
             self._running = False
             return f"Goodbye {OWNER_ADDRESS}. Shutting down STAR SARA."
 
+        payload = strip_phrases(command, IntentClassifier.trigger_phrases(intent))
+
         if intent == "remember":
-            information = command
-            for phrase in ("remember that", "remember"):
-                information = information.replace(phrase, "", 1)
-            information = information.strip()
-            return self.ai.remember("user_note", information)
+            return self.ai.remember("user_note", payload)
 
         if intent == "add_task":
-            task = command
-            for phrase in ("add task", "new task", "add a task"):
-                task = task.replace(phrase, "", 1)
-            self.ai.add_task(task.strip())
+            self.ai.add_task(payload)
             return f"I added this task, {OWNER_ADDRESS}."
 
         if intent == "list_tasks":
@@ -1089,20 +1074,14 @@ class AssistantWorker(QThread):
             return self.ai.format_due_today()
 
         if intent == "save_note":
-            note = command
-            for phrase in ("save note", "take a note", "new note"):
-                note = note.replace(phrase, "", 1)
-            self.ai.save_note("Voice Note", note.strip())
+            self.ai.save_note("Voice Note", payload)
             return f"I saved your note, {OWNER_ADDRESS}."
 
         if intent == "list_notes":
             return self.ai.format_notes()
 
         if intent == "search_notes":
-            query = command
-            for phrase in ("find my note", "search notes", "note about"):
-                query = query.replace(phrase, "", 1)
-            return self.ai.search_notes(query.strip())
+            return self.ai.search_notes(payload)
 
         # default: free-form conversation, with full context/memory/history
         return self.ai.ask(command)
@@ -1178,7 +1157,7 @@ class AssistantWorker(QThread):
             except Exception as error:
                 traceback.print_exc()
                 self.error_occurred.emit(str(error))
-                response = f"Sorry {OWNER_ADDRESS}, something went wrong handling that."
+                response = _apology("something went wrong handling that.")
 
             if not self._running:
                 return
@@ -1196,25 +1175,60 @@ class AssistantWorker(QThread):
 
 
 # ==============================================================================
+# ASSISTANT STATE PRESENTATION
+# ==============================================================================
+
+# One row per assistant state instead of five parallel dicts keyed by the same
+# state names (core colour, animation speed, wave amplitude, window title,
+# subtitle) — adding or renaming a state now touches a single place.
+STATE_PRESENTATION = {
+    "loading": {
+        "color": QColor(90, 90, 140),
+        "speed": 0.6,
+        "wave": 2.0,
+        "title": "STAR SARA LOADING",
+        "subtitle": "Warming up voice systems...",
+    },
+    "idle": {
+        "color": QColor(0, 190, 255),
+        "speed": 0.8,
+        "wave": 3.0,
+        "title": "STAR SARA ONLINE",
+        "subtitle": "Waiting for command...",
+    },
+    "listening": {
+        "color": QColor(0, 255, 220),
+        "speed": 2.2,
+        "wave": 9.0,
+        "title": "STAR SARA ACTIVE",
+        "subtitle": "Listening...",
+    },
+    "processing": {
+        "color": QColor(170, 60, 255),
+        "speed": 3.4,
+        "wave": 14.0,
+        "title": "STAR SARA THINKING",
+        "subtitle": "Thinking...",
+    },
+    "speaking": {
+        "color": QColor(80, 220, 255),
+        "speed": 2.6,
+        "wave": 11.0,
+        "title": "STAR SARA RESPONDING",
+        "subtitle": "Responding...",
+    },
+}
+
+
+def state_attribute(state: str, attribute: str, default):
+    return STATE_PRESENTATION.get(state, {}).get(attribute, default)
+
+
+# ==============================================================================
 # STAR CORE WIDGET — the glowing reactor animation (UNCHANGED from v2)
 # ==============================================================================
 
 class StarCoreWidget(QWidget):
-    STATE_COLORS = {
-        "loading":    QColor(90, 90, 140),
-        "idle":       QColor(0, 190, 255),
-        "listening":  QColor(0, 255, 220),
-        "processing": QColor(170, 60, 255),
-        "speaking":   QColor(80, 220, 255),
-    }
-
-    STATE_SPEED = {
-        "loading": 0.6,
-        "idle": 0.8,
-        "listening": 2.2,
-        "processing": 3.4,
-        "speaking": 2.6,
-    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1244,18 +1258,12 @@ class StarCoreWidget(QWidget):
         self._timer.start(30)
 
     def set_state(self, state: str) -> None:
-        if state in self.STATE_COLORS:
+        if state in STATE_PRESENTATION:
             self.state = state
-            self.target_wave_amplitude = {
-                "loading": 2.0,
-                "idle": 3.0,
-                "listening": 9.0,
-                "processing": 14.0,
-                "speaking": 11.0,
-            }.get(state, 3.0)
+            self.target_wave_amplitude = state_attribute(state, "wave", 3.0)
 
     def _tick(self) -> None:
-        speed = self.STATE_SPEED.get(self.state, 1.0)
+        speed = state_attribute(self.state, "speed", 1.0)
 
         self.angle1 = (self.angle1 + speed * 1.4) % 360
         self.angle2 = (self.angle2 - speed * 0.9) % 360
@@ -1278,7 +1286,7 @@ class StarCoreWidget(QWidget):
         center = QPointF(width / 2, height / 2)
         base_radius = min(width, height) * 0.36
 
-        color = self.STATE_COLORS.get(self.state, QColor(0, 190, 255))
+        color = state_attribute(self.state, "color", QColor(0, 190, 255))
         pulse = (math.sin(math.radians(self.pulse_phase)) + 1) / 2
 
         glow_radius = base_radius * (1.55 + 0.12 * pulse)
@@ -1321,8 +1329,7 @@ class StarCoreWidget(QWidget):
             theta = (i / points) * 2 * math.pi
             wobble = self.wave_amplitude * math.sin(theta * 6 + math.radians(self.pulse_phase * 2))
             r = wave_radius + wobble
-            x = center.x() + r * math.cos(theta)
-            y = center.y() + r * math.sin(theta)
+            x, y = polar_point(center.x(), center.y(), r, theta)
             if i == 0:
                 path.moveTo(x, y)
             else:
@@ -1334,8 +1341,7 @@ class StarCoreWidget(QWidget):
         for particle in self.particles:
             r = base_radius * particle["radius"]
             theta = math.radians(particle["angle"])
-            x = center.x() + r * math.cos(theta)
-            y = center.y() + r * math.sin(theta)
+            x, y = polar_point(center.x(), center.y(), r, theta)
             dot_color = QColor(color)
             dot_color.setAlpha(180)
             painter.setBrush(QBrush(dot_color))
@@ -1370,8 +1376,7 @@ class StarCoreWidget(QWidget):
         for i in range(10):
             angle = math.radians(-90 + i * 36)
             r = radius if i % 2 == 0 else radius * 0.42
-            x = center.x() + r * math.cos(angle)
-            y = center.y() + r * math.sin(angle)
+            x, y = polar_point(center.x(), center.y(), r, angle)
             points.append(QPointF(x, y))
         path = QPainterPath()
         path.addPolygon(points)
@@ -1441,22 +1446,6 @@ class InfoPanel(QFrame):
 
 class FuturisticGUI(QMainWindow):
 
-    STATE_TITLES = {
-        "loading":    "STAR SARA LOADING",
-        "idle":       "STAR SARA ONLINE",
-        "listening":  "STAR SARA ACTIVE",
-        "processing": "STAR SARA THINKING",
-        "speaking":   "STAR SARA RESPONDING",
-    }
-
-    STATE_SUBTITLES = {
-        "loading":    "Warming up voice systems...",
-        "idle":       "Waiting for command...",
-        "listening":  "Listening...",
-        "processing": "Thinking...",
-        "speaking":   "Responding...",
-    }
-
     def __init__(self, core: "StarSaraCore"):
         super().__init__()
         self.core = core
@@ -1479,11 +1468,11 @@ class FuturisticGUI(QMainWindow):
         core_layout.setSpacing(16)
         core_layout.setAlignment(Qt.AlignHCenter)
 
-        self.title_label = QLabel("STAR SARA LOADING")
+        self.title_label = QLabel(state_attribute("loading", "title", "STAR SARA"))
         self.title_label.setObjectName("titleLabel")
         self.title_label.setAlignment(Qt.AlignCenter)
 
-        self.subtitle_label = QLabel("Warming up voice systems...")
+        self.subtitle_label = QLabel(state_attribute("loading", "subtitle", ""))
         self.subtitle_label.setObjectName("subtitleLabel")
         self.subtitle_label.setAlignment(Qt.AlignCenter)
 
@@ -1507,9 +1496,9 @@ class FuturisticGUI(QMainWindow):
     @Slot(str)
     def on_state_changed(self, state: str) -> None:
         self.star_core.set_state(state)
-        self.title_label.setText(self.STATE_TITLES.get(state, "STAR SARA"))
-        self.subtitle_label.setText(self.STATE_SUBTITLES.get(state, ""))
-        self.info_panel.set_status(self.STATE_TITLES.get(state, "Online"))
+        self.title_label.setText(state_attribute(state, "title", "STAR SARA"))
+        self.subtitle_label.setText(state_attribute(state, "subtitle", ""))
+        self.info_panel.set_status(state_attribute(state, "title", "Online"))
 
     @Slot(str)
     def on_owner_said(self, text: str) -> None:
