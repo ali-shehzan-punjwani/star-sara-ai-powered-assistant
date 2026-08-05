@@ -1,0 +1,11 @@
+[run]
+source = star_sara_v3
+
+[report]
+# The GUI (StarCoreWidget / InfoPanel / FuturisticGUI), the live audio capture
+# loop, TTS playback, and main() require real PySide6, audio, and display
+# hardware, so they are outside the scope of the hermetic unit suite.
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    def main
