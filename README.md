@@ -605,6 +605,12 @@ STAR SARA stores all user information locally.
 | notes.json | Saved notes |
 | tasks.json | Task manager |
 
+These four files are **git-ignored** because they hold personal data. On first
+run each one is created automatically from its `*.example.json` template
+(`user_data.example.json`, `memory.example.json`, `notes.example.json`,
+`tasks.example.json`), with owner-only (`0600`) permissions. Edit
+`user_data.json` locally to personalize the assistant — never commit it.
+
 No personal information is stored on external servers unless required by the AI service used for processing requests.
 
 ---

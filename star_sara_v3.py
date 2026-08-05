@@ -175,21 +175,50 @@ NOTES_FILE = os.path.join(BASE_DIR, "notes.json")
 # ==============================================================================
 
 def save_json(file_path: str, data: dict) -> None:
+    """
+    Writes JSON atomically with owner-only permissions. These files hold
+    personal profile data, tasks, notes and learned facts, so they must not be
+    world-readable, and a crash mid-write must not truncate the existing file.
+    """
+    temp_path = f"{file_path}.tmp"
     try:
-        with open(file_path, "w", encoding="utf-8") as file:
+        descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
             json.dump(data, file, indent=4, ensure_ascii=False)
+        os.replace(temp_path, file_path)
     except Exception as error:
         print(f"[ERROR] Saving JSON ({file_path}): {error}")
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
 
 
 def load_json(file_path: str, default: dict) -> dict:
+    """
+    Loads a local data file, seeding it from `<name>.example.json` on first run.
+    The real files stay out of version control so personal data is never
+    committed. Anything that isn't a JSON object falls back to `default`.
+    """
     try:
-        if os.path.exists(file_path):
-            with open(file_path, "r", encoding="utf-8") as file:
-                return json.load(file)
-        else:
-            save_json(file_path, default)
+        if not os.path.exists(file_path):
+            root, extension = os.path.splitext(file_path)
+            example_path = f"{root}.example{extension}"
+            seed = default
+            if os.path.exists(example_path):
+                with open(example_path, "r", encoding="utf-8") as file:
+                    loaded = json.load(file)
+                if isinstance(loaded, dict):
+                    seed = loaded
+            save_json(file_path, seed)
+            return seed
+
+        with open(file_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        if not isinstance(data, dict):
+            print(f"[WARNING] {file_path} is not a JSON object — using defaults.")
             return default
+        return data
     except Exception as error:
         print(f"[ERROR] Loading JSON ({file_path}): {error}")
         return default
@@ -301,14 +330,14 @@ class AIEngine:
                 "greeting": f"Yes, {OWNER_ADDRESS}. How may I assist you today?",
             },
             "identity": {
-                "full_name": "Ali Shehzan Punjwani",
-                "preferred_name": "Shehzan",
-                "country": "Pakistan",
-                "city": "Karachi",
+                "full_name": "",
+                "preferred_name": "",
+                "country": "",
+                "city": "",
             },
             "career": {
-                "current_focus": "Cloud Security",
-                "target_role": "Chief Information Security Officer (CISO)",
+                "current_focus": "",
+                "target_role": "",
             },
         })
 
@@ -974,6 +1003,7 @@ class VoiceEngine:
             except Exception:
                 pass  # barge-in is a nice-to-have; never let it crash playback
 
+        audio_file = None
         try:
             audio_file = asyncio.run(self._generate_voice(text))
 
@@ -994,13 +1024,20 @@ class VoiceEngine:
                     monitor_thread.join(timeout=0.5)
 
                 pygame.mixer.music.unload()
-                os.remove(audio_file)
 
             return not interrupted.is_set()
 
         except Exception as error:
             print(f"[ERROR] Voice playback failed: {error}")
             return True
+
+        finally:
+            stop_monitor.set()
+            if audio_file:
+                try:
+                    os.remove(audio_file)
+                except OSError:
+                    pass
 
 
 # ==============================================================================
