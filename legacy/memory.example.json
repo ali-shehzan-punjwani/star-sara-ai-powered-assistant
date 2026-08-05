@@ -1,0 +1,23 @@
+{
+  "memory": [
+    {
+      "id": 1,
+      "category": "preference",
+      "key": "assistant_name",
+      "value": "STAR SARA"
+    },
+    {
+      "id": 2,
+      "category": "communication",
+      "key": "preferred_language",
+      "value": "English"
+    },
+    {
+      "id": 3,
+      "category": "communication",
+      "key": "response_style",
+      "value": "Professional, concise, and friendly"
+    }
+  ],
+  "facts": []
+}
