@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# STAR SARA platform
+node_modules/
+.next/
+out/
+.env.local
+backend/data/*.json
