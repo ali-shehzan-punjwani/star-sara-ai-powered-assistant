@@ -27,17 +27,18 @@ ffmpeg_path = os.path.join(os.path.dirname(__file__), "ffmpeg", "bin")
 os.environ["PATH"] = ffmpeg_path + os.pathsep + os.environ["PATH"]
 import sys
 import json
+import logging
 import math
 import time
 import random
 import asyncio
+import difflib
 import tempfile
-import traceback
 import re
 import threading
 from collections import deque
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import Callable, List, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -51,24 +52,34 @@ import pygame
 
 # ---- optional / graceful-degradation dependencies ----
 
+# WHY `except ImportError` and not `except Exception`: a bare Exception here
+# also hides real bugs inside the try block. It did: `RAPIDFUZZ_AVAILABLE`
+# used to be assigned from an undefined name (`Truea`), so the NameError was
+# swallowed and rapidfuzz was reported unavailable even when installed —
+# fuzzy wake-word matching never ran once.
 try:
     from rapidfuzz import fuzz as _fuzz
-    RAPIDFUZZ_AVAILABLE = Truea
-except Exception:
-    import difflib
+    RAPIDFUZZ_AVAILABLE = True
+except ImportError as error:
+    _fuzz = None
     RAPIDFUZZ_AVAILABLE = False
+    _MISSING_OPTIONAL_DEPS = [f"rapidfuzz ({error}) — falling back to difflib fuzzy matching"]
+else:
+    _MISSING_OPTIONAL_DEPS = []
 
 try:
     import webrtcvad
     WEBRTCVAD_AVAILABLE = True
-except Exception:
+except ImportError as error:
     WEBRTCVAD_AVAILABLE = False
+    _MISSING_OPTIONAL_DEPS.append(f"webrtcvad ({error}) — falling back to fixed-duration recording")
 
 try:
     import noisereduce as nr
     NOISEREDUCE_AVAILABLE = True
-except Exception:
+except ImportError as error:
     NOISEREDUCE_AVAILABLE = False
+    _MISSING_OPTIONAL_DEPS.append(f"noisereduce ({error}) — audio will not be noise-reduced")
 
 from PySide6.QtCore import (
     Qt, QTimer, QThread, Signal, Slot, QObject, QRectF, QPointF
@@ -81,6 +92,57 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
     QFrame, QSizePolicy, QTextEdit
 )
+
+
+# ==============================================================================
+# LOGGING & ERRORS
+# ==============================================================================
+
+logger = logging.getLogger("star_sara")
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """
+    Sends every diagnostic through one logger instead of scattered `print`
+    calls, so failures always carry a level and (via `logger.exception`) a
+    full traceback rather than a one-line message with no context.
+    """
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(level)
+
+
+class StarSaraError(Exception):
+    """Base class for every failure STAR SARA raises deliberately."""
+
+
+class StorageError(StarSaraError):
+    """Reading or writing one of the JSON state files failed."""
+
+
+class AudioCaptureError(StarSaraError):
+    """The microphone could not be read (device missing, busy, misconfigured)."""
+
+
+class TranscriptionError(StarSaraError):
+    """Whisper could not be loaded or could not transcribe a clip."""
+
+
+class SpeechSynthesisError(StarSaraError):
+    """Edge-TTS could not synthesize speech, or playback failed."""
+
+
+class AIEngineError(StarSaraError):
+    """The Groq request failed or came back unusable."""
+
+
+configure_logging()
+
+for _missing in _MISSING_OPTIONAL_DEPS:
+    logger.warning("Optional dependency unavailable: %s", _missing)
 
 
 # ==============================================================================
@@ -98,10 +160,10 @@ if GROQ_API_KEY:
     try:
         GROQ_CLIENT = Groq(api_key=GROQ_API_KEY)
         GROQ_AVAILABLE = True
-    except Exception as error:
-        print(f"[ERROR] Could not initialize Groq client: {error}")
+    except Exception:
+        logger.exception("Could not initialize Groq client — AI brain will run in offline mode.")
 else:
-    print("[WARNING] GROQ_API_KEY missing in .env — AI brain will run in offline mode.")
+    logger.warning("GROQ_API_KEY missing in .env — AI brain will run in offline mode.")
 
 
 # ==============================================================================
@@ -175,24 +237,108 @@ NOTES_FILE = os.path.join(BASE_DIR, "notes.json")
 # ==============================================================================
 
 def save_json(file_path: str, data: dict) -> None:
+    """
+    Writes `data` atomically (temp file + os.replace) and raises StorageError
+    if it could not be written.
+
+    WHY: the previous version printed the error and returned normally, so
+    every caller — and therefore the owner — was told "I will remember that"
+    / "I added this task" even when nothing reached disk. It also wrote in
+    place, so a crash mid-write left a truncated, unparseable file.
+    """
+    directory = os.path.dirname(os.path.abspath(file_path))
+    temp_path: Optional[str] = None
     try:
-        with open(file_path, "w", encoding="utf-8") as file:
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=directory,
+            prefix=f".{os.path.basename(file_path)}.", suffix=".tmp", delete=False,
+        ) as file:
+            temp_path = file.name
             json.dump(data, file, indent=4, ensure_ascii=False)
-    except Exception as error:
-        print(f"[ERROR] Saving JSON ({file_path}): {error}")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, file_path)
+        temp_path = None
+    except (OSError, TypeError, ValueError) as error:
+        raise StorageError(f"could not save {os.path.basename(file_path)}: {error}") from error
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError as cleanup_error:
+                logger.warning("Could not remove temp file %s: %s", temp_path, cleanup_error)
+
+
+def _quarantine_unreadable_file(file_path: str) -> Optional[str]:
+    """
+    Moves an unreadable/corrupt state file aside instead of leaving it to be
+    silently overwritten by the next save. Returns the backup path, or None
+    if it could not be moved.
+    """
+    backup_path = f"{file_path}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    try:
+        os.replace(file_path, backup_path)
+        return backup_path
+    except OSError as error:
+        logger.error("Could not quarantine unreadable file %s: %s", file_path, error)
+        return None
 
 
 def load_json(file_path: str, default: dict) -> dict:
-    try:
-        if os.path.exists(file_path):
-            with open(file_path, "r", encoding="utf-8") as file:
-                return json.load(file)
-        else:
+    """
+    Loads a state file, falling back to `default` only for genuinely
+    recoverable situations — and never silently: a corrupt or wrong-shaped
+    file is logged at ERROR level and moved aside (see
+    `_quarantine_unreadable_file`) so the owner's data is preserved instead
+    of being clobbered by the next write.
+    """
+    if not os.path.exists(file_path):
+        try:
             save_json(file_path, default)
-            return default
-    except Exception as error:
-        print(f"[ERROR] Loading JSON ({file_path}): {error}")
+        except StorageError as error:
+            logger.error("Could not create %s, continuing in memory only: %s", file_path, error)
         return default
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except json.JSONDecodeError as error:
+        backup_path = _quarantine_unreadable_file(file_path)
+        logger.error(
+            "%s is not valid JSON (%s); starting from defaults. Previous file kept at %s",
+            file_path, error, backup_path or "<could not be moved>",
+        )
+        return default
+    except OSError as error:
+        logger.error("Could not read %s, using defaults for this session: %s", file_path, error)
+        return default
+
+    if not isinstance(data, dict):
+        backup_path = _quarantine_unreadable_file(file_path)
+        logger.error(
+            "%s contained %s instead of a JSON object; starting from defaults. "
+            "Previous file kept at %s",
+            file_path, type(data).__name__, backup_path or "<could not be moved>",
+        )
+        return default
+
+    return data
+
+
+def _remove_file(file_path: str) -> None:
+    """Deletes a temp file, logging (never raising) if it cannot be removed."""
+    try:
+        os.remove(file_path)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        logger.warning("Could not remove temp file %s: %s", file_path, error)
+
+
+def _note_text(note: Dict) -> str:
+    """'Title: content' for a possibly incomplete note record."""
+    return f"{note.get('title', 'Untitled')}: {note.get('content', '')}".strip()
 
 
 def _text_similarity(a: str, b: str) -> float:
@@ -259,7 +405,7 @@ class AudioProcessor:
             noise_clip = flat[: int(sample_rate * 0.3)]
             return nr.reduce_noise(y=flat, sr=sample_rate, y_noise=noise_clip, stationary=True)
         except Exception as error:
-            print(f"[WARN] noisereduce failed, using raw audio: {error}")
+            logger.warning("noisereduce failed, using raw audio: %s", error)
             return audio
 
     @classmethod
@@ -320,6 +466,9 @@ class AIEngine:
         self._PROFILE_SECTIONS_EXCLUDED_FROM_LLM = {"identity", "contact", "family"}
 
         self.memory = load_json(MEMORY_FILE, {"facts": []})
+        if not isinstance(self.memory.get("facts"), list):
+            logger.error("memory.json had no usable 'facts' list; starting with an empty memory.")
+            self.memory["facts"] = []
         self._migrate_memory_schema()
         self._decay_memory()
 
@@ -332,13 +481,15 @@ class AIEngine:
         # be missing the "tasks"/"notes" key entirely, and every direct
         # self.tasks["tasks"] / self.notes["notes"] access below would raise
         # KeyError the first time something tried to write to it.
-        if not isinstance(self.tasks, dict):
-            self.tasks = {"tasks": []}
         self.tasks.setdefault("tasks", [])
+        if not isinstance(self.tasks["tasks"], list):
+            logger.error("tasks.json had no usable 'tasks' list; starting with no tasks.")
+            self.tasks["tasks"] = []
 
-        if not isinstance(self.notes, dict):
-            self.notes = {"notes": []}
         self.notes.setdefault("notes", [])
+        if not isinstance(self.notes["notes"], list):
+            logger.error("notes.json had no usable 'notes' list; starting with no notes.")
+            self.notes["notes"] = []
 
         # short-term multi-turn context (not persisted — resets per session,
         # anything worth keeping long-term should go through `remember()`)
@@ -385,7 +536,28 @@ class AIEngine:
                 fact["access_count"] = 0
                 changed = True
         if changed:
-            save_json(MEMORY_FILE, self.memory)
+            # A failed migration write is not worth aborting startup over, but
+            # it must be visible: the schema upgrade will simply be redone next
+            # run, and any later write will surface the same error to the owner.
+            self._persist(MEMORY_FILE, self.memory, "memory schema migration")
+
+    # ---------------- persistence ----------------
+
+    @staticmethod
+    def _persist(file_path: str, data: dict, what: str) -> bool:
+        """
+        Best-effort save for bookkeeping writes (access counters, decay,
+        schema migration) whose failure must not break the current turn.
+        Logs the failure at ERROR level and reports whether it succeeded —
+        callers that owe the owner an answer (remember/add_task/save_note)
+        deliberately do NOT use this and let StorageError propagate instead.
+        """
+        try:
+            save_json(file_path, data)
+            return True
+        except StorageError as error:
+            logger.error("Could not persist %s: %s", what, error)
+            return False
 
     # ---------------- memory: write ----------------
 
@@ -395,17 +567,31 @@ class AIEngine:
         (fuzzy match on the value text) and updates it instead of appending —
         this is what stops memory.json from filling up with the same fact
         phrased three slightly different ways.
+
+        Raises StorageError if the fact could not be written to disk; the
+        in-memory state is rolled back first so what STAR SARA believes she
+        remembers always matches what is actually persisted.
         """
+        if not value:
+            return f"There was nothing to remember, {OWNER_ADDRESS}."
+
         facts = self.memory.setdefault("facts", [])
 
         for fact in facts:
             if _text_similarity(fact.get("value", ""), value) >= MEMORY_DEDUPE_FUZZY_THRESHOLD:
+                previous = dict(fact)
                 fact["value"] = value
                 fact["importance"] = max(fact.get("importance", 3), importance)
                 fact["last_accessed"] = datetime.now().isoformat()
-                save_json(MEMORY_FILE, self.memory)
+                try:
+                    save_json(MEMORY_FILE, self.memory)
+                except StorageError:
+                    fact.clear()
+                    fact.update(previous)
+                    raise
                 return f"I updated what I remembered, {OWNER_ADDRESS}."
 
+        previous_facts = list(facts)
         facts.append({
             "key": key,
             "value": value,
@@ -418,10 +604,14 @@ class AIEngine:
         # keep the file bounded — drop the least important, least recently
         # accessed fact rather than growing forever
         if len(facts) > MEMORY_MAX_FACTS:
-            facts.sort(key=lambda f: (f["importance"], f["last_accessed"]))
+            facts.sort(key=lambda f: (f.get("importance", 3), f.get("last_accessed", "")))
             facts.pop(0)
 
-        save_json(MEMORY_FILE, self.memory)
+        try:
+            save_json(MEMORY_FILE, self.memory)
+        except StorageError:
+            self.memory["facts"] = previous_facts
+            raise
         return f"I will remember that, {OWNER_ADDRESS}."
 
     # ---------------- memory: read / rank ----------------
@@ -431,6 +621,7 @@ class AIEngine:
             if item.get("key") == key:
                 item["access_count"] = item.get("access_count", 0) + 1
                 item["last_accessed"] = datetime.now().isoformat()
+                self._persist(MEMORY_FILE, self.memory, "memory access stats")
                 return item.get("value")
         return None
 
@@ -461,7 +652,7 @@ class AIEngine:
             fact["last_accessed"] = datetime.now().isoformat()
 
         if top:
-            save_json(MEMORY_FILE, self.memory)
+            self._persist(MEMORY_FILE, self.memory, "memory access stats")
 
         return top
 
@@ -480,9 +671,16 @@ class AIEngine:
         kept = []
         removed = 0
         for fact in facts:
+            raw_timestamp = fact.get("last_accessed") or fact.get("created_at")
             try:
-                last_accessed = datetime.fromisoformat(fact.get("last_accessed", fact.get("created_at")))
-            except Exception:
+                last_accessed = datetime.fromisoformat(raw_timestamp)
+            except (TypeError, ValueError) as error:
+                # Treat an unreadable timestamp as "just accessed" so the fact
+                # survives decay, but say so instead of hiding a broken record.
+                logger.warning(
+                    "Fact %r has an unreadable timestamp (%r): %s — keeping it.",
+                    fact.get("key"), raw_timestamp, error,
+                )
                 last_accessed = datetime.now()
 
             is_stale = (
@@ -497,8 +695,8 @@ class AIEngine:
 
         if removed:
             self.memory["facts"] = kept
-            save_json(MEMORY_FILE, self.memory)
-            print(f"[INFO] Memory decay removed {removed} stale low-importance fact(s).")
+            if self._persist(MEMORY_FILE, self.memory, "memory decay"):
+                logger.info("Memory decay removed %d stale low-importance fact(s).", removed)
 
     # ---------------- conversation history ----------------
 
@@ -508,14 +706,20 @@ class AIEngine:
     # ---------------- tasks ----------------
 
     def add_task(self, task_text: str, priority: str = "normal", due: Optional[str] = None) -> None:
-        self.tasks["tasks"].append({
+        """Raises StorageError (after rolling back) if the task cannot be saved."""
+        tasks = self.tasks["tasks"]
+        tasks.append({
             "task": task_text,
             "priority": priority,
             "status": "pending",
             "due": due,  # ISO date string or None — powers "calendar awareness" below
             "created_at": datetime.now().isoformat(),
         })
-        save_json(TASKS_FILE, self.tasks)
+        try:
+            save_json(TASKS_FILE, self.tasks)
+        except StorageError:
+            tasks.pop()
+            raise
 
     def get_pending_tasks(self) -> List[Dict]:
         return [t for t in self.tasks.get("tasks", []) if t.get("status") == "pending"]
@@ -525,12 +729,26 @@ class AIEngine:
         return [t for t in self.get_pending_tasks() if t.get("due") == today]
 
     def complete_task(self, index: int) -> bool:
-        try:
-            self.tasks["tasks"][index]["status"] = "completed"
-            save_json(TASKS_FILE, self.tasks)
-            return True
-        except Exception:
+        """
+        Returns False for an out-of-range index; raises StorageError if the
+        task exists but the change could not be written. WHY: the previous
+        blanket `except Exception: return False` made "no such task" and
+        "the disk is full" indistinguishable to the caller.
+        """
+        tasks = self.tasks["tasks"]
+        if not -len(tasks) <= index < len(tasks):
+            logger.warning("complete_task called with out-of-range index %s (%d tasks).", index, len(tasks))
             return False
+
+        task = tasks[index]
+        previous_status = task.get("status")
+        task["status"] = "completed"
+        try:
+            save_json(TASKS_FILE, self.tasks)
+        except StorageError:
+            task["status"] = previous_status
+            raise
+        return True
 
     def format_tasks(self) -> str:
         pending = self.get_pending_tasks()
@@ -540,7 +758,7 @@ class AIEngine:
         response = f"You have {len(pending)} pending tasks. "
         for number, task in enumerate(pending, start=1):
             due_note = f", due {task['due']}" if task.get("due") else ""
-            response += f"Task {number}: {task['task']}{due_note}. "
+            response += f"Task {number}: {task.get('task', '(untitled task)')}{due_note}. "
         return response
 
     def format_due_today(self) -> str:
@@ -549,18 +767,24 @@ class AIEngine:
             return f"Nothing is due today, {OWNER_ADDRESS}."
         response = f"You have {len(due)} task(s) due today. "
         for number, task in enumerate(due, start=1):
-            response += f"Task {number}: {task['task']}. "
+            response += f"Task {number}: {task.get('task', '(untitled task)')}. "
         return response
 
     # ---------------- notes ----------------
 
     def save_note(self, title: str, content: str) -> None:
-        self.notes["notes"].append({
+        """Raises StorageError (after rolling back) if the note cannot be saved."""
+        notes = self.notes["notes"]
+        notes.append({
             "title": title,
             "content": content,
             "created_at": datetime.now().isoformat(),
         })
-        save_json(NOTES_FILE, self.notes)
+        try:
+            save_json(NOTES_FILE, self.notes)
+        except StorageError:
+            notes.pop()
+            raise
 
     def format_notes(self) -> str:
         notes = self.notes.get("notes", [])
@@ -569,7 +793,7 @@ class AIEngine:
 
         response = f"You have {len(notes)} saved notes. "
         for number, note in enumerate(notes, start=1):
-            response += f"Note {number}: {note['title']}. {note['content']}. "
+            response += f"Note {number}: {_note_text(note)}. "
         return response
 
     def search_notes(self, query: str) -> str:
@@ -578,15 +802,13 @@ class AIEngine:
         if not notes:
             return f"You do not have any saved notes, {OWNER_ADDRESS}."
 
-        scored = sorted(
-            notes,
-            key=lambda n: _text_similarity(query, f"{n['title']} {n['content']}"),
-            reverse=True,
-        )
-        best = scored[0]
-        if _text_similarity(query, f"{best['title']} {best['content']}") < 40:
+        # WHY .get-based access (see `_note_text`): notes.json is hand-editable,
+        # and a single note missing "title" used to raise KeyError here, which
+        # the caller reported to the owner as a generic "something went wrong".
+        best = max(notes, key=lambda note: _text_similarity(query, _note_text(note)))
+        if _text_similarity(query, _note_text(best)) < 40:
             return f"I couldn't find a note matching that, {OWNER_ADDRESS}."
-        return f"Closest match — {best['title']}: {best['content']}"
+        return f"Closest match — {_note_text(best)}"
 
     # ---------------- Groq brain ----------------
 
@@ -641,16 +863,26 @@ PERSONALITY & REASONING RULES:
                 temperature=0.5,     # lower than v2's 0.7 — less rambling, fewer invented details
                 max_tokens=500,
             )
-            reply = response.choices[0].message.content.strip()
-
-            self.add_turn("user", message)
-            self.add_turn("assistant", reply)
-
-            return reply
-
         except Exception as error:
-            print(f"[ERROR] Groq error: {error}")
-            return f"Sorry {OWNER_ADDRESS}, I am having trouble right now."
+            # The Groq SDK raises a family of API/connection/timeout errors, so
+            # this stays broad — but the full traceback is logged and the
+            # failure is re-raised as an AIEngineError so the caller (and the
+            # GUI log) learns that the turn failed instead of only the console.
+            logger.exception("Groq request failed.")
+            raise AIEngineError(f"Groq request failed: {error}") from error
+
+        if not response.choices:
+            raise AIEngineError("Groq returned no choices for this message.")
+
+        content = response.choices[0].message.content
+        if content is None or not content.strip():
+            raise AIEngineError("Groq returned an empty message.")
+
+        reply = content.strip()
+        self.add_turn("user", message)
+        self.add_turn("assistant", reply)
+
+        return reply
 
 
 # ==============================================================================
@@ -739,16 +971,41 @@ class VoiceEngine:
       stops immediately instead of finishing the sentence.
     """
 
-    def __init__(self):
+    def __init__(self, error_reporter: Optional[Callable[[str], None]] = None):
         self._model = None
         self._vad = webrtcvad.Vad(VAD_AGGRESSIVENESS) if WEBRTCVAD_AVAILABLE else None
         self._last_wake_trigger_time = 0.0
-        pygame.mixer.init()
+
+        # WHY a reporter callback: VoiceEngine has no Qt signals of its own, so
+        # non-fatal voice failures (TTS, playback, barge-in) used to end up in
+        # the console only. The worker wires this to `error_occurred` so the
+        # owner sees them in the GUI log instead of wondering why STAR SARA
+        # went quiet.
+        self.error_reporter = error_reporter
+
+        try:
+            pygame.mixer.init()
+            self._playback_available = True
+        except Exception as error:
+            self._playback_available = False
+            logger.error("Audio playback unavailable (pygame mixer failed to initialise): %s", error)
+
+    def _report(self, message: str) -> None:
+        if self.error_reporter:
+            try:
+                self.error_reporter(message)
+            except Exception:
+                logger.exception("Error reporter itself failed while reporting: %s", message)
 
     def load_model(self) -> None:
-        print("[INFO] Loading Whisper model...")
-        self._model = whisper.load_model(WHISPER_MODEL_NAME)
-        print("[INFO] Whisper model loaded successfully.")
+        logger.info("Loading Whisper model...")
+        try:
+            self._model = whisper.load_model(WHISPER_MODEL_NAME)
+        except Exception as error:
+            raise TranscriptionError(
+                f"could not load Whisper model '{WHISPER_MODEL_NAME}': {error}"
+            ) from error
+        logger.info("Whisper model loaded successfully.")
 
     # ---------------- speech to text ----------------
 
@@ -759,6 +1016,10 @@ class VoiceEngine:
         time to wait for the owner to START talking (not total recording
         length) — once speech starts, VAD keeps recording until it detects
         the trailing silence, regardless of `duration`.
+
+        Returns None only when nothing usable was HEARD. Device and decoding
+        failures raise AudioCaptureError / TranscriptionError instead, so a
+        broken microphone can no longer masquerade as an endless silence.
         """
         if allow_vad and WEBRTCVAD_AVAILABLE:
             audio = self._record_with_vad(max_wait_seconds=duration)
@@ -783,10 +1044,9 @@ class VoiceEngine:
                 dtype="float32",
             )
             sd.wait()
-            return audio.flatten()
-        except Exception:
-            traceback.print_exc()
-            return None
+        except Exception as error:
+            raise AudioCaptureError(f"microphone capture failed: {error}") from error
+        return audio.flatten()
 
     def _record_with_vad(self, max_wait_seconds: float = VAD_MAX_RECORD_SECONDS) -> Optional[np.ndarray]:
         """
@@ -834,9 +1094,8 @@ class VoiceEngine:
                         # nobody started talking within the allotted wait —
                         # give up instead of listening the full 12s every time
                         break
-        except Exception:
-            traceback.print_exc()
-            return None
+        except Exception as error:
+            raise AudioCaptureError(f"microphone stream failed: {error}") from error
 
         if not speech_started or not collected:
             return None
@@ -845,6 +1104,9 @@ class VoiceEngine:
         return audio
 
     def _transcribe(self, audio: np.ndarray) -> Optional[str]:
+        if self._model is None:
+            raise TranscriptionError("Whisper model is not loaded yet.")
+
         try:
             result = self._model.transcribe(
                 audio,
@@ -861,14 +1123,13 @@ class VoiceEngine:
             if segments and all(seg.get("no_speech_prob", 0) > WHISPER_NO_SPEECH_THRESHOLD for seg in segments):
                 return None
 
-            text = result["text"].strip().lower()
+            text = (result.get("text") or "").strip().lower()
             if not text or self._is_likely_hallucination(text):
                 return None
             return text
 
-        except Exception:
-            traceback.print_exc()
-            return None
+        except Exception as error:
+            raise TranscriptionError(f"Whisper failed to transcribe the clip: {error}") from error
 
     @staticmethod
     def _is_likely_hallucination(text: str) -> bool:
@@ -933,28 +1194,40 @@ class VoiceEngine:
 
     # ---------------- text to speech ----------------
 
-    async def _generate_voice(self, text: str) -> Optional[str]:
+    async def _generate_voice(self, text: str) -> str:
+        """
+        Synthesizes `text` to a temp mp3 and returns its path, raising
+        SpeechSynthesisError on failure. The half-written temp file is removed
+        on the failure path — previously it was created before the download
+        and leaked on every TTS error.
+        """
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as file:
+            audio_file = file.name
         try:
             communicate = edge_tts.Communicate(text=text, voice=TTS_VOICE)
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as file:
-                audio_file = file.name
             await communicate.save(audio_file)
-            return audio_file
         except Exception as error:
-            print(f"[ERROR] Edge-TTS error: {error}")
-            return None
+            _remove_file(audio_file)
+            raise SpeechSynthesisError(f"Edge-TTS could not synthesize speech: {error}") from error
+        return audio_file
 
     def speak(self, text: str, allow_barge_in: bool = ENABLE_BARGE_IN) -> bool:
         """
         Speaks the given text. Blocking — call from the worker thread only.
-        Returns True if it played to completion, False if it was interrupted
-        (barge-in) — the caller can use that to immediately start listening
-        again instead of waiting for the sentence to finish.
+        Returns True if it played to completion, and False if it was
+        interrupted (barge-in) OR failed — a failure is also reported through
+        `error_reporter` so it reaches the GUI log rather than being reduced
+        to a console line and an unconditional `return True`, which is what
+        made a mute STAR SARA look like a successful turn.
         """
         if not text:
             return True
 
-        print(f"{ASSISTANT_NAME}: {text}")
+        logger.info("%s: %s", ASSISTANT_NAME, text)
+
+        if not self._playback_available:
+            self._report("Cannot speak: audio playback device is unavailable.")
+            return False
 
         interrupted = threading.Event()
         stop_monitor = threading.Event()
@@ -972,35 +1245,48 @@ class VoiceEngine:
                         pygame.mixer.music.stop()
                         return
             except Exception:
-                pass  # barge-in is a nice-to-have; never let it crash playback
+                # Barge-in is a nice-to-have and must never crash playback, but
+                # a mic that cannot be sampled is worth knowing about — log it
+                # instead of the previous bare `pass`.
+                logger.exception("Barge-in monitor stopped after an error; playback continues.")
 
         try:
             audio_file = asyncio.run(self._generate_voice(text))
+        except SpeechSynthesisError as error:
+            logger.exception("Speech synthesis failed.")
+            self._report(str(error))
+            return False
 
-            if audio_file:
-                pygame.mixer.music.load(audio_file)
-                pygame.mixer.music.play()
+        monitor_thread = None
+        try:
+            pygame.mixer.music.load(audio_file)
+            pygame.mixer.music.play()
 
-                monitor_thread = None
-                if allow_barge_in:
-                    monitor_thread = threading.Thread(target=_monitor_for_barge_in, daemon=True)
-                    monitor_thread.start()
+            if allow_barge_in:
+                monitor_thread = threading.Thread(target=_monitor_for_barge_in, daemon=True)
+                monitor_thread.start()
 
-                while pygame.mixer.music.get_busy():
-                    time.sleep(0.05)
-
-                stop_monitor.set()
-                if monitor_thread:
-                    monitor_thread.join(timeout=0.5)
-
-                pygame.mixer.music.unload()
-                os.remove(audio_file)
+            while pygame.mixer.music.get_busy():
+                time.sleep(0.05)
 
             return not interrupted.is_set()
 
         except Exception as error:
-            print(f"[ERROR] Voice playback failed: {error}")
-            return True
+            logger.exception("Voice playback failed.")
+            self._report(f"Voice playback failed: {error}")
+            return False
+
+        finally:
+            # WHY finally: the temp mp3 used to be removed only on the happy
+            # path, so every playback error leaked a file in the temp dir.
+            stop_monitor.set()
+            if monitor_thread:
+                monitor_thread.join(timeout=0.5)
+            try:
+                pygame.mixer.music.unload()
+            except Exception as error:
+                logger.warning("Could not unload playback buffer: %s", error)
+            _remove_file(audio_file)
 
 
 # ==============================================================================
@@ -1026,11 +1312,14 @@ class AssistantWorker(QThread):
     error_occurred = Signal(str)
     shutdown_requested = Signal()
 
+    MAX_CONSECUTIVE_LISTEN_FAILURES = 5
+
     def __init__(self, ai_engine: AIEngine, voice_engine: VoiceEngine, parent=None):
         super().__init__(parent)
         self.ai = ai_engine
         self.voice = voice_engine
         self._running = True
+        self.voice.error_reporter = self.error_occurred.emit
 
     def stop(self) -> None:
         self._running = False
@@ -1042,8 +1331,8 @@ class AssistantWorker(QThread):
         # on its next check.
         try:
             sd.stop()
-        except Exception:
-            pass
+        except Exception as error:
+            logger.warning("Could not abort in-flight audio capture during shutdown: %s", error)
 
     # ---------------- command handling ----------------
 
@@ -1122,25 +1411,60 @@ class AssistantWorker(QThread):
             self.voice.speak(greeting)
 
             self.state_changed.emit("idle")
-
-            while self._running:
-                try:
-                    text = self.voice.listen(LISTEN_DURATION_WAKE)
-
-                    if text:
-                        print(f"Heard: {text}")
-
-                    if self.voice.contains_wake_word(text):
-                        self._handle_activation()
-
-                except Exception as loop_error:
-                    self.error_occurred.emit(str(loop_error))
-                    traceback.print_exc()
-                    time.sleep(1)
+            self._listen_loop()
 
         except Exception as fatal_error:
-            self.error_occurred.emit(str(fatal_error))
-            traceback.print_exc()
+            # Startup failed (most often the Whisper model). The thread is
+            # about to end, so say so explicitly instead of leaving the GUI
+            # stuck on "LOADING" with one console traceback as the only clue.
+            logger.exception("STAR SARA could not start.")
+            self.error_occurred.emit(f"STAR SARA could not start: {fatal_error}")
+            self.state_changed.emit("idle")
+
+    def _listen_loop(self) -> None:
+        """
+        Idle wake-word loop. Voice failures are surfaced to the GUI and backed
+        off exponentially, and the loop gives up after
+        MAX_CONSECUTIVE_LISTEN_FAILURES so a permanently broken microphone
+        stops spinning (and logging) forever — previously every iteration
+        failed silently apart from a console traceback and a 1s sleep.
+        """
+        consecutive_failures = 0
+
+        while self._running:
+            try:
+                text = self.voice.listen(LISTEN_DURATION_WAKE)
+                consecutive_failures = 0
+
+                if text:
+                    logger.info("Heard: %s", text)
+
+                if self.voice.contains_wake_word(text):
+                    self._handle_activation()
+
+            except (AudioCaptureError, TranscriptionError) as voice_error:
+                if not self._running:
+                    return  # capture was aborted by stop() — expected, not a failure
+
+                consecutive_failures += 1
+                logger.exception("Voice input failed (attempt %d).", consecutive_failures)
+                self.error_occurred.emit(str(voice_error))
+
+                if consecutive_failures >= self.MAX_CONSECUTIVE_LISTEN_FAILURES:
+                    self.error_occurred.emit(
+                        "Giving up on the microphone after "
+                        f"{consecutive_failures} consecutive failures. "
+                        "Check the audio input device and restart STAR SARA."
+                    )
+                    self._running = False
+                    return
+
+                time.sleep(min(2 ** consecutive_failures, 10))
+
+            except Exception as loop_error:
+                logger.exception("Unexpected error in the listen loop.")
+                self.error_occurred.emit(str(loop_error))
+                time.sleep(1)
 
     def _handle_activation(self) -> None:
         """
@@ -1161,7 +1485,15 @@ class AssistantWorker(QThread):
             timeout = LISTEN_DURATION_COMMAND if is_first_turn else CONVERSATION_FOLLOWUP_TIMEOUT
             is_first_turn = False
 
-            command = self.voice.listen(timeout)
+            try:
+                command = self.voice.listen(timeout)
+            except (AudioCaptureError, TranscriptionError) as voice_error:
+                if not self._running:
+                    return
+                logger.exception("Voice input failed during an active conversation.")
+                self.error_occurred.emit(str(voice_error))
+                break  # drop back to the idle loop, which handles retry/backoff
+
             if not self._running:
                 return
             if not command:
@@ -1175,8 +1507,22 @@ class AssistantWorker(QThread):
             self.state_changed.emit("processing")
             try:
                 response = self._process_command(command)
+            except StorageError as error:
+                # The owner asked STAR SARA to save something and it did not
+                # reach disk — tell them that, rather than confirming a write
+                # that never happened (the old save_json behaviour).
+                logger.exception("Could not persist state for command %r.", command)
+                self.error_occurred.emit(str(error))
+                response = (
+                    f"Sorry {OWNER_ADDRESS}, I could not save that to disk, "
+                    "so I have not kept it."
+                )
+            except AIEngineError as error:
+                logger.exception("AI request failed for command %r.", command)
+                self.error_occurred.emit(str(error))
+                response = f"Sorry {OWNER_ADDRESS}, I could not reach my AI brain just now."
             except Exception as error:
-                traceback.print_exc()
+                logger.exception("Unexpected error handling command %r.", command)
                 self.error_occurred.emit(str(error))
                 response = f"Sorry {OWNER_ADDRESS}, something went wrong handling that."
 
@@ -1595,7 +1941,7 @@ class FuturisticGUI(QMainWindow):
 class StarSaraCore:
     def __init__(self):
         self.ai_engine = AIEngine()
-        self.voice_engine = VoiceEngine()
+        self.voice_engine = VoiceEngine()  # error_reporter wired by AssistantWorker
         self.worker = AssistantWorker(self.ai_engine, self.voice_engine)
         self.gui: Optional[FuturisticGUI] = None
 
@@ -1627,9 +1973,16 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("STAR SARA")
 
-    core = StarSaraCore()
-    gui = FuturisticGUI(core)
-    core.attach_gui(gui)
+    try:
+        core = StarSaraCore()
+        gui = FuturisticGUI(core)
+        core.attach_gui(gui)
+    except StarSaraError as error:
+        # Startup cannot recover from these (unwritable state files, no audio
+        # subsystem). Exit with a non-zero status and a clear message instead
+        # of dying on an unhandled traceback.
+        logger.critical("STAR SARA failed to start: %s", error)
+        sys.exit(1)
 
     gui.show()
     core.start()
