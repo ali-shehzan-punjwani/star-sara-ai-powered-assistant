@@ -218,8 +218,15 @@ __marimo__/
 .streamlit/secrets.toml
 
 # STAR SARA local data (personal profile, memory, tasks, notes)
-user_data.json
-memory.json
-tasks.json
-notes.json
+legacy/user_data.json
+legacy/memory.json
+legacy/tasks.json
+legacy/notes.json
 *.json.tmp
+
+# STAR SARA platform
+node_modules/
+.next/
+out/
+.env.local
+backend/data/*.json
