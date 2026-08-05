@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Chat } from "@/components/Chat";
 import { CoreConsole } from "@/components/CoreConsole";
@@ -23,13 +23,19 @@ export default function Dashboard() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [mode, setMode] = useState<AccuracyMode>("fast");
   const [alwaysOn, setAlwaysOn] = useState(false);
+  // /api/status reports the server default; the live mode is per-connection, so
+  // only the first load may seed it — later polls must not undo a user choice.
+  const modeSeeded = useRef(false);
 
   useEffect(() => {
     const load = async () => {
       try {
         const [nextStatus, nextTasks] = await Promise.all([fetchStatus(), fetchTasks()]);
         setStatus(nextStatus);
-        setMode(nextStatus.engine.accuracy_mode);
+        if (!modeSeeded.current) {
+          setMode(nextStatus.engine.accuracy_mode);
+          modeSeeded.current = true;
+        }
         setTasks(nextTasks.tasks.filter((task) => task.status === "pending"));
       } catch {
         setStatus(null);

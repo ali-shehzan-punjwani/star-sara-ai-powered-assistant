@@ -49,6 +49,7 @@ async def voice_socket(websocket: WebSocket) -> None:
 
             if event.type == "config" and event.data:
                 session.configure(event.data)
+                logger.info("Session config: %s", event.data)
             elif event.type == "text" and event.text:
                 # The client already rendered its own message; no transcript event.
                 await session.handle_text(
